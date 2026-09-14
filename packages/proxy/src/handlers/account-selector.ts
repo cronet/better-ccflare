@@ -14,11 +14,18 @@ import {
 } from "@better-ccflare/providers";
 import type {
 	Account,
+	ApiKeyRestrictions,
 	ComboFamily,
 	ComboSlotInfo,
 	RequestMeta,
 } from "@better-ccflare/types";
 import { getKnownCodexModels } from "../codex-model-catalog";
+import {
+	isAccountAllowedForApiKey,
+	restrictsAccountPool,
+	setApiKeyRestrictionDenial,
+	summarizeAccountRestrictionScope,
+} from "./api-key-restrictions";
 import {
 	type FamilyExhaustionOrigin,
 	getFamilyExhaustionOrigin,
@@ -410,12 +417,18 @@ export function resolveEffectiveModel(
  * cooldown" — don't have to issue a second DB read.
  * @param meta - Request metadata
  * @param ctx - The proxy context
+ * @param restrictions - The calling API key's account/provider allowlist, or
+ *   null when the key is unrestricted, no key is in play (zero-keys mode), or
+ *   the request is a verified internal probe. It arrives ALREADY exempted:
+ *   `selectAccountsForRequest` resolves the probe exemption once, for every
+ *   seam, and this function must not second-guess it.
  * @returns `ordered` — the strategy-filtered candidates; `all` — every account
  *   from the DB, unfiltered.
  */
 export async function getOrderedAccounts(
 	meta: RequestMeta,
 	ctx: ProxyContext,
+	restrictions?: ApiKeyRestrictions | null,
 ): Promise<{ ordered: Account[]; all: Account[] }> {
 	try {
 		const allAccounts = await ctx.dbOps.getAllAccounts();
@@ -457,8 +470,39 @@ export async function getOrderedAccounts(
 		// usage-capped account genuinely has no free capacity, so it must not
 		// be mistaken for one of those "actually has capacity" accounts.
 		// Provider is still determined dynamically per account downstream.
+		//
+		// Seam 1 — per-API-key account + provider allowlist.
+		//
+		// Same argument as the usage-cap filter above, and the reason this sits
+		// here rather than inside the strategies: this is the only point where
+		// the raw pool exists before any of the five strategies sees it, so one
+		// insertion covers all of them. It must be BEFORE `ctx.strategy.select`
+		// specifically — session affinity picks a sticky account from whatever
+		// it is handed, and filtering afterwards would let it return an account
+		// this key may not use (or, worse, return nothing while a permitted
+		// account sat further down the list).
+		const permitted = restrictsAccountPool(restrictions)
+			? candidates.filter((account) =>
+					isAccountAllowedForApiKey(account, restrictions),
+				)
+			: candidates;
+		if (permitted.length !== candidates.length) {
+			log.info(
+				`API key restrictions: ${permitted.length}/${candidates.length} account(s) permitted for this key`,
+			);
+		}
+		if (permitted.length === 0 && candidates.length > 0) {
+			// The restriction, not capacity, emptied the pool. proxy.ts reads
+			// this back to answer with a 403 policy refusal instead of the
+			// generic pool_exhausted 503, which would advertise a Retry-After
+			// for a condition no amount of waiting changes.
+			setApiKeyRestrictionDenial(meta, {
+				scope: summarizeAccountRestrictionScope(restrictions),
+				removed: candidates.length,
+			});
+		}
 		return {
-			ordered: ctx.strategy.select(candidates, meta),
+			ordered: ctx.strategy.select(permitted, meta),
 			all: allAccounts,
 		};
 	} catch (error) {
@@ -488,7 +532,10 @@ export async function getOrderedAccounts(
  * @param meta - Request metadata
  * @param ctx - The proxy context
  * @param model - Optional model string for combo family detection
- * @param options - `skipCombo` makes the combo lookup an explicit no-op —
+ * @param options - `restrictions` carries the calling API key's account /
+ *   provider allowlist (null or absent = unrestricted, which is also what
+ *   zero-keys mode and a key with all three columns NULL produce). `skipCombo`
+ *   makes the combo lookup an explicit no-op —
  *   used by proxy.ts's Step-10 fallback re-selection after a combo's own
  *   slots have already been attempted and failed, so it falls straight into
  *   normal (capacity-filtered) routing instead of re-triggering the same
@@ -500,8 +547,31 @@ export async function selectAccountsForRequest(
 	meta: RequestMeta,
 	ctx: ProxyContext,
 	model?: string,
-	options?: { skipCombo?: boolean },
+	options?: { skipCombo?: boolean; restrictions?: ApiKeyRestrictions | null },
 ): Promise<Account[]> {
+	// Per-API-key restrictions, resolved ONCE here and reused by every
+	// account-side seam below (the forced-account header, the combo slots, the
+	// cooldown-masking sweep, and getOrderedAccounts's pool filter). One
+	// resolution point means one place to audit the carve-outs:
+	//
+	//   - No key / an unrestricted key yields null, and every predicate is then
+	//     a no-op. That covers zero-keys mode, where auth is disabled entirely
+	//     and no key record exists to carry restrictions.
+	//   - A VERIFIED internal probe yields null too. The auto-refresh and
+	//     keepalive schedulers call the proxy with no API key at all, and a
+	//     probe refused by a routing rule counts as a refresh failure — five of
+	//     those pause a perfectly healthy account. Same exemption, same reason,
+	//     as the forced-account model check and the usage-throttling bypass.
+	//     `isInternalProbe` verifies the process-local probe secret, so a
+	//     client that copies the marker header out of a log gets nothing.
+	const keyRestrictions =
+		options?.restrictions && !isInternalProbe(meta.headers, ctx)
+			? options.restrictions
+			: null;
+	const poolRestricted = restrictsAccountPool(keyRestrictions);
+	const isPermittedForKey = (account: Account): boolean =>
+		isAccountAllowedForApiKey(account, keyRestrictions);
+
 	// Check if a specific account is requested via special header
 	if (meta.headers) {
 		const forcedAccountId = meta.headers.get("x-better-ccflare-account-id");
@@ -512,6 +582,37 @@ export async function selectAccountsForRequest(
 					(acc) => acc.id === forcedAccountId,
 				);
 				if (forcedAccount) {
+					// Seam 2 — a restricted key must not name its way past its
+					// own allowlist.
+					//
+					// This block returns [forcedAccount] without ever reaching
+					// getOrderedAccounts, where the pool filter lives, so
+					// without this check the header is a complete bypass: any
+					// restricted key could name any account in the estate.
+					//
+					// Refusing — an empty selection, which proxy.ts answers as
+					// api_key_account_restricted — rather than falling through
+					// to normal selection, for exactly the reason the
+					// force-account-model refusal below gives: falling through
+					// would silently serve a DIFFERENT account than the header
+					// named. Here it would also be pointless, since normal
+					// selection applies the same filter.
+					//
+					// Internal probes are exempt by construction: keyRestrictions
+					// is null for them (see the resolution at the top of this
+					// function).
+					if (poolRestricted && !isPermittedForKey(forcedAccount)) {
+						log.warn(
+							`API key restrictions: refusing forced account ${forcedAccount.name} — this key is limited to specific ${summarizeAccountRestrictionScope(keyRestrictions)}`,
+						);
+						setApiKeyRestrictionDenial(meta, {
+							scope: "forced account",
+							removed: 1,
+							forcedAccountName: forcedAccount.name,
+						});
+						return [];
+					}
+
 					// With "force account model" on, a header naming an account
 					// does not get to skip the one rule the setting exists for.
 					//
@@ -730,6 +831,19 @@ export async function selectAccountsForRequest(
 							continue;
 						}
 
+						// Seam 3 — combo slots read getAllAccounts() directly and
+						// never call getOrderedAccounts, so seam 1 does not cover
+						// them. A combo whose slots name accounts outside the
+						// key's allowlist would otherwise route straight past it.
+						// Dropping the slot (rather than refusing outright) is
+						// deliberate: a combo is a routing preference, and the
+						// remaining permitted slots — or the SessionStrategy
+						// fallthrough below, which re-applies seam 1 — are still
+						// legitimate ways to serve this key.
+						if (poolRestricted && !isPermittedForKey(account)) {
+							continue;
+						}
+
 						// Per-slot capacity check uses the slot's own model override
 						// (not the combo family's request model), since slots can carry
 						// distinct concrete models within the same family.
@@ -791,7 +905,7 @@ export async function selectAccountsForRequest(
 	}
 
 	const { ordered: rawOrderedAccounts, all: allAccounts } =
-		await getOrderedAccounts(meta, ctx);
+		await getOrderedAccounts(meta, ctx, keyRestrictions);
 	let orderedAccounts = applyExclusions(rawOrderedAccounts);
 
 	// "Force account model": keep only accounts that can serve the requested
@@ -872,7 +986,15 @@ export async function selectAccountsForRequest(
 				// request, not just cooling down — can never be reported as
 				// the "true blocker" with its cooldown as Retry-After.
 				const orderedIds = new Set(orderedAccounts.map((a) => a.id));
-				const sweepCandidates = applyExclusions(allAccounts);
+				// Seam 4 — the same argument, one step further. An account this
+				// API key may not use is permanently ineligible for this
+				// request, not "sidelined for minutes", so reporting it as the
+				// true blocker would hand the caller a Retry-After for an
+				// account that will never serve them.
+				const sweepBase = applyExclusions(allAccounts);
+				const sweepCandidates = poolRestricted
+					? sweepBase.filter(isPermittedForKey)
+					: sweepBase;
 				let earliestCooldownResetAt: number | null = null;
 				for (const account of sweepCandidates) {
 					if (orderedIds.has(account.id)) continue;

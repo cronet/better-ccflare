@@ -22,6 +22,17 @@ export {
 	isRewriteTargetServable,
 } from "./agent-interceptor";
 export {
+	type ApiKeyRestrictionDenial,
+	type ApiKeyRestrictionScope,
+	getApiKeyRestrictionDenial,
+	isAccountAllowedForApiKey,
+	isModelAllowedForApiKey,
+	restrictsAccountPool,
+	restrictsModels,
+	setApiKeyRestrictionDenial,
+	summarizeAccountRestrictionScope,
+} from "./api-key-restrictions";
+export {
 	clearFamilyExhaustionForAccount,
 	createModelFamilyExhaustedResponse,
 	type FamilyExhaustionOrigin,

@@ -8,6 +8,7 @@ import { TIME_CONSTANTS } from "@better-ccflare/core";
 import type {
 	Account,
 	AgentAttributionSource,
+	ApiKeyRestrictions,
 	Combo,
 	ComboFamily,
 	ComboFamilyAssignment,
@@ -18,6 +19,7 @@ import type {
 	RateLimitReason,
 	StrategyStore,
 } from "@better-ccflare/types";
+import { serializeRestrictionList } from "@better-ccflare/types";
 import {
 	BunSqlAdapter,
 	PG_CLIENT_QUERY_TIMEOUT_MS,
@@ -1896,6 +1898,7 @@ OAuth tokens will need to be re-authenticated.
 		lastUsed?: number | null;
 		isActive: boolean;
 		role?: "admin" | "api-only";
+		restrictions?: Partial<ApiKeyRestrictions>;
 	}): Promise<void> {
 		await withDatabaseRetry(
 			() =>
@@ -1908,6 +1911,17 @@ OAuth tokens will need to be re-authenticated.
 					last_used: apiKey.lastUsed || null,
 					is_active: apiKey.isActive ? 1 : 0,
 					role: apiKey.role || "api-only",
+					// `?? null` throughout: an omitted restriction is NULL
+					// (unrestricted), which is not the same as '[]' (deny-all).
+					allowed_accounts: serializeRestrictionList(
+						apiKey.restrictions?.allowedAccounts ?? null,
+					),
+					allowed_models: serializeRestrictionList(
+						apiKey.restrictions?.allowedModels ?? null,
+					),
+					allowed_providers: serializeRestrictionList(
+						apiKey.restrictions?.allowedProviders ?? null,
+					),
 				}),
 			this.retryConfig,
 			"createApiKey",
@@ -1954,6 +1968,21 @@ OAuth tokens will need to be re-authenticated.
 			() => this.apiKeys.updateRole(id, role),
 			this.retryConfig,
 			"updateApiKeyRole",
+		);
+	}
+
+	/**
+	 * Replace an API key's account / model / provider restrictions.
+	 * `null` on a field means unrestricted; `[]` means deny-all.
+	 */
+	async updateApiKeyRestrictions(
+		id: string,
+		restrictions: ApiKeyRestrictions,
+	): Promise<boolean> {
+		return withDatabaseRetry(
+			() => this.apiKeys.updateRestrictions(id, restrictions),
+			this.retryConfig,
+			"updateApiKeyRestrictions",
 		);
 	}
 

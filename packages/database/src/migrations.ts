@@ -265,7 +265,10 @@ export function ensureSchema(db: Database): void {
 			created_at INTEGER NOT NULL,
 			last_used INTEGER,
 			usage_count INTEGER DEFAULT 0,
-			is_active INTEGER DEFAULT 1
+			is_active INTEGER DEFAULT 1,
+			allowed_accounts TEXT,
+			allowed_models TEXT,
+			allowed_providers TEXT
 		)
 	`);
 
@@ -1446,6 +1449,29 @@ export function runMigrations(db: Database, dbPath?: string): void {
 				"CREATE INDEX IF NOT EXISTS idx_api_keys_role ON api_keys(role)",
 			).run();
 			log.info("Created index on api_keys role column");
+		}
+
+		// Add the per-key restriction columns to api_keys if they don't exist.
+		//
+		// Three nullable TEXT columns, each holding a JSON array, rather than a
+		// join table with ON DELETE CASCADE: with a join table, deleting the
+		// last allowed account would empty the list and silently turn a
+		// restricted key back into an unrestricted one. NULL means
+		// "unrestricted" and '[]' means "deny all", a distinction a cascade
+		// cannot express. Same TEXT-JSON shape the accounts table already uses
+		// for model_mappings / model_fallbacks.
+		//
+		// No DEFAULT and no NOT NULL on purpose: every existing key must come
+		// out of this migration unrestricted, which is exactly NULL.
+		for (const column of [
+			"allowed_accounts",
+			"allowed_models",
+			"allowed_providers",
+		]) {
+			if (!apiKeysColumnNames.includes(column)) {
+				db.prepare(`ALTER TABLE api_keys ADD COLUMN ${column} TEXT`).run();
+				log.info(`Added ${column} column to api_keys table`);
+			}
 		}
 
 		// Add performance indexes
