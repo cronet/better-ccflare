@@ -125,7 +125,8 @@ export function ensureSchema(db: Database): void {
 			consecutive_rate_limits INTEGER NOT NULL DEFAULT 0,
 			requires_reauth INTEGER DEFAULT 0,
 			last_manual_reauth_at INTEGER,
-			request_transformer TEXT
+			request_transformer TEXT,
+			plan_monthly_usd REAL
 		)
 	`);
 
@@ -1489,6 +1490,31 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			).run();
 
 			log.info("Removed account_tier column from accounts table");
+		}
+
+		// Add plan_monthly_usd: the real dollar price of the account's monthly
+		// subscription (NULL = unknown / not a paid plan). Distinct from
+		// plan_cost_usd on requests, which is a counterfactual "what this plan
+		// traffic would have cost at API rates".
+		//
+		// This block sits AFTER both accounts-table rebuilds on purpose, and
+		// re-reads PRAGMA table_info instead of using initialAccountsColumnNames
+		// (captured at the top of runMigrations, before any DDL). Both rebuilds
+		// copy a HARDCODED column list into an accounts_new and drop the
+		// original: the "make refresh_token nullable" rebuild above, and the
+		// account_tier removal directly above. A column added earlier in this
+		// same transaction would be silently dropped by either of them on a
+		// legacy database — which is exactly how billing_type, peak_hours_pause_enabled
+		// and friends can still go missing on one migration pass. Adding the
+		// column last, against the live schema, is immune to both.
+		const accountsColumnsAfterRebuilds = (
+			db.prepare("PRAGMA table_info(accounts)").all() as Array<{
+				name: string;
+			}>
+		).map((col) => col.name);
+		if (!accountsColumnsAfterRebuilds.includes("plan_monthly_usd")) {
+			db.prepare("ALTER TABLE accounts ADD COLUMN plan_monthly_usd REAL").run();
+			log.info("Added plan_monthly_usd column to accounts table");
 		}
 
 		// Drop tier column from oauth_sessions table if it exists
