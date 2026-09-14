@@ -62,6 +62,7 @@ import {
 	createApiKeysStatsHandler,
 	createApiKeyUpdateRestrictionsHandler,
 	createApiKeyUpdateRoleHandler,
+	createApiKeyUpdateSpendLimitHandler,
 } from "./handlers/api-keys";
 import {
 	createComboCreateHandler,
@@ -860,6 +861,25 @@ export class APIRouter {
 				);
 				return await this.wrapHandler((req) =>
 					updateRestrictionsHandler(req, keyIdOrName),
+				)(req, url);
+			}
+
+			// API key spend limit update - Only admin keys can set or clear
+			// another key's budget. Same gate, same 401-not-403 house style, as
+			// the role and restrictions routes above.
+			if (path.endsWith("/limit") && method === "PATCH") {
+				if (authResult.role !== "admin") {
+					return errorResponse(
+						Unauthorized(
+							"Only admin keys can update API key spend limits. Your key has api-only access.",
+						),
+					);
+				}
+				const updateSpendLimitHandler = createApiKeyUpdateSpendLimitHandler(
+					this.context.dbOps,
+				);
+				return await this.wrapHandler((req) =>
+					updateSpendLimitHandler(req, keyIdOrName),
 				)(req, url);
 			}
 
