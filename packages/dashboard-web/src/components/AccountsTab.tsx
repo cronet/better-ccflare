@@ -543,6 +543,18 @@ export function AccountsTab() {
 		}
 	};
 
+	const handlePlanPriceChange = async (
+		account: Account,
+		planMonthlyUsd: number | null,
+	) => {
+		try {
+			await api.updateAccountPlanPrice(account.id, planMonthlyUsd);
+			await loadAccounts();
+		} catch (err) {
+			setActionError(formatError(err));
+		}
+	};
+
 	const handleAutoPauseOnOverageToggle = async (account: Account) => {
 		try {
 			await api.updateAccountAutoPauseOnOverage(
@@ -714,6 +726,7 @@ export function AccountsTab() {
 						onAutoFallbackToggle={handleAutoFallbackToggle}
 						onAutoRefreshToggle={handleAutoRefreshToggle}
 						onBillingTypeToggle={handleBillingTypeToggle}
+						onPlanPriceChange={handlePlanPriceChange}
 						onAutoPauseOnOverageToggle={handleAutoPauseOnOverageToggle}
 						onPeakHoursPauseToggle={handlePeakHoursPauseToggle}
 						onCustomEndpointChange={handleCustomEndpointChange}
